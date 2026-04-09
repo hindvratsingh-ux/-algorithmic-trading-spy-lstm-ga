@@ -1,0 +1,1814 @@
+---
+title: "CS815 - Assignment 2"
+author: "Jatin Preet Singh (202556602), Daniel Kashani (202568776), Hindvrat Singh Rao()"
+date: "2026-04-08"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+# Introduction
+In this study, we focus on developing a price prediction-based trading strategy for the SPDR S&P 500 ETF Trust (SPY). An LSTM model is employed to predict future price movements using historical market features, including price and technical indicators. Additionally, GA was deployed to optimise these technical inidcators for their best parameters based on fitness that aligns with our objective of profitability. Based on these predictions, a rule-based trading strategy is constructed to generate buy, sell, or hold signals.
+
+To evaluate the effectiveness of the proposed approach, the strategy is backtested on unseen data using an initial capital of £10,000. Performance is assessed using key financial metrics such as returns, win rate, and risk-adjusted measures. Also, the strategy’s performance is compared against benchmark approaches, including a random trading strategy and a passive buy-and-hold strategy, to provide a robust evaluation of its practical utility.
+
+This work demonstrates how machine learning can be integrated with trading logic to create automated strategies and highlights the challenges and considerations involved in applying predictive models to real-world financial decision-making.
+
+# Packages
+```{r include=FALSE}
+library(quantmod)
+library(TTR)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(GA)
+library(zoo)
+library(caret)
+library(keras3)
+library(abind)
+library(patchwork)
+library(gridExtra)
+library(knitr)
+library(scales)
+```
+
+# Inputs
+
+We choose the asset to be SPY, as it broadly covers the US equity market behaviour. Data used was from January 2021 to January 2026, considering post Covid market stability.
+
+```{r include=FALSE}
+ticker <- "SPY"
+start_date <- as.Date("2021-01-01")
+end_date <- as.Date("2026-01-31")
+train_ratio <- 0.80
+
+ema_period <- 12
+rsi_period <- 14
+
+macd_fast <- 12
+macd_slow <- 26
+macd_sig  <- 9
+
+```
+
+
+# Downloading the data
+
+The data was download from Yahoo Finance for the selected asset and date range. It is returned as a time series object, so I first inspect it and then convert it into a normal data frame for easier use later.
+
+```{r include=FALSE}
+getSymbols(Symbols = ticker, src = "yahoo", from = start_date, to = end_date, auto.assign = TRUE)
+
+stock_xts <- get(ticker)
+```
+
+# Inspecting the downloaded object
+
+```{r }
+str(stock_xts)
+head(stock_xts)
+tail(stock_xts)
+```
+
+```{r include=FALSE}
+data_raw <- data.frame(
+  date = index(stock_xts),
+  coredata(stock_xts)
+)
+
+colnames(data_raw) <- c(
+  "date",
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "adjusted"
+)
+
+data_raw$date <- as.Date(data_raw$date)
+
+data_raw <- data_raw %>%
+  arrange(date)
+
+head(data_raw)
+tail(data_raw)
+```
+
+# Data preprocessing
+
+EDA on data:
+
+```{r include=FALSE}
+dim(data_raw)
+summary(data_raw)
+```
+
+# Checking missing values
+
+check whether any values are missing in the raw data.
+
+```{r}
+colSums(is.na(data_raw))
+```
+
+# Checking duplicate dates
+
+Since this is daily time-series data, each trading day should appear only once.so checking whether there are any duplicate dates.
+
+```{r}
+sum(duplicated(data_raw$date))
+```
+
+If any duplicate dates exist, I remove them and keep the first occurrence.
+
+```{r}
+data_raw <- data_raw %>%
+  distinct(date, .keep_all = TRUE)
+```
+
+# Making sure the data is sorted by date
+
+This step ensures that the observations remain in chronological order, which is very important for time-series analysis and backtesting.
+
+```{r}
+data_raw <- data_raw %>%
+  arrange(date)
+```
+
+
+```{r include=FALSE}
+head(data_raw)
+tail(data_raw)
+dim(data_raw)
+summary(data_raw)
+```
+
+# Exploratory overview of the data
+
+We create a few simple plots to understand the stock data before generating technical indicators.
+
+# Plot of adjusted closing price
+
+```{r echo=FALSE}
+ggplot(data_raw, aes(x = date, y = adjusted)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title = paste("Adjusted Closing Price of", ticker),
+    x = "Date",
+    y = "Adjusted Close"
+  ) +
+  theme_minimal()
+```
+
+# Plot of trading volume
+
+```{r echo=FALSE}
+ggplot(data_raw, aes(x = date, y = volume)) +
+  geom_line(color = "darkorange") +
+  labs(
+    title = paste("Trading Volume of", ticker),
+    x = "Date",
+    y = "Volume"
+  ) +
+  theme_minimal()
+```
+
+
+```{r include=FALSE}
+data_features <- data_raw %>%
+  mutate(
+    simple_return = (adjusted / lag(adjusted)) - 1,
+    log_return = log(adjusted / lag(adjusted))
+  )
+```
+
+```{r include=FALSE}
+head(data_features)
+summary(data_features$simple_return)
+summary(data_features$log_return)
+```
+#Generating TEchnical indicators
+1. MACD
+2. EMAs
+3. RSI
+
+```{r}
+add_ema_feature <- function(df, price_col = "adjusted", period) {
+  df$ema <- TTR::EMA(df[[price_col]], n = as.integer(period))
+  return(df)
+}
+
+add_rsi_feature <- function(df, price_col = "adjusted", period) {
+  col_name <- paste0("rsi_", period)
+  df[[col_name]] <- TTR::RSI(df[[price_col]], n = as.integer(period))
+  return(df)
+}
+
+add_macd_feature <- function(df, price_col = "adjusted", fast, slow, sig) {
+  macd_obj <- TTR::MACD(
+    x = df[[price_col]],
+    nFast = as.integer(fast),
+    nSlow = as.integer(slow),
+    nSig = as.integer(sig),
+    maType = EMA
+  )
+
+  macd_name   <- paste0("macd_", fast,"_", slow,"_", sig)
+  signal_name <- paste0("signal_", fast,"_", slow,"_", sig)
+  hist_name   <- paste0("hist_", fast,"_", slow,"_", sig)
+
+  df[[macd_name]]   <- macd_obj[, 1]
+  df[[signal_name]] <- macd_obj[, 2]
+  df[[hist_name]]   <- macd_obj[, 1] - macd_obj[, 2]
+  return(df)
+}
+```
+
+
+```{r include=FALSE}
+data_features <- add_ema_feature(
+  df = data_features,
+  price_col = "adjusted",
+  period = ema_period
+)
+
+data_features <- add_rsi_feature(
+  df = data_features,
+  price_col = "adjusted",
+  period = rsi_period
+)
+
+data_features <- add_macd_feature(
+  df = data_features,
+  price_col = "adjusted",
+  fast = macd_fast,
+  slow = macd_slow,
+  sig = macd_sig
+)
+```
+
+# Adding a few extra useful variables
+
+adding a few simple derived variables from the price data that moight be useful for modelling.
+
+```{r}
+data_features <- data_features %>%
+  mutate(
+    price_change = adjusted - lag(adjusted),
+    high_low_range = high - low,
+    open_close_range = close - open,
+    volume_millions = volume / 1000000
+  )
+```
+
+```{r include=FALSE}
+head(data_features)
+tail(data_features)
+colnames(data_features)
+```
+
+
+```{r include=FALSE}
+colSums(is.na(data_features))
+```
+
+```{rinclude=FALSE}
+data_features <- data_features %>%
+  filter(complete.cases(.))
+```
+
+# Checking the cleaned feature dataset
+
+```{r include=FALSE}
+colSums(is.na(data_features))
+dim(data_features)
+head(data_features)
+tail(data_features)
+```
+
+#GA based indicator parameter optimisationb.
+Optimising MACD and RSI using GA in order to get the best parameters based on our data. The Goal is to find indicator parameters that best predict future returns.
+
+Train-test split for GA Optimisation:
+GA needs to optimised only on train data to avoid data leakage
+```{r}
+n_total <- nrow(data_features)
+train_size <- floor(train_ratio * n_total)
+
+train_data <- data_features[1:train_size, ]
+test_data <- data_features[(train_size + 1):n_total, ]
+```
+
+```{r GA indicator optimisation}
+
+# Combined fitness function for both MACD and RSI
+fitness_combined_predictive <- function(par) {
+  
+  # Validate inputs
+  if (length(par) < 4 || any(is.na(par)) || any(!is.finite(par))) {
+    return(-1e6)
+  }
+  
+  # Extract parameters
+  macd_fast <- as.integer(round(par[1]))
+  macd_slow <- as.integer(round(par[2]))
+  macd_sig  <- as.integer(round(par[3]))
+  rsi_n     <- as.integer(round(par[4]))
+  
+  # Constraints
+  if (any(is.na(c(macd_fast, macd_slow, macd_sig, rsi_n)))) return(-1e6)
+  if (macd_fast >= macd_slow) return(-1e6)
+  if (rsi_n < 5 || rsi_n > 25) return(-1e6)
+  
+  # Calculate indicators
+  macd_obj <- MACD(
+    train_data$adjusted,
+    nFast = macd_fast,
+    nSlow = macd_slow,
+    nSig = macd_sig,
+    maType = EMA
+  )
+  
+  rsi_vals <- RSI(train_data$adjusted, n = rsi_n)
+  
+  # Prepare data
+  temp <- train_data %>%
+    mutate(
+      macd = macd_obj[, 1],
+      signal = macd_obj[, 2],
+      rsi = rsi_vals,
+      future_return = lead(simple_return, 1)  # Next day's return
+    ) %>%
+    filter(complete.cases(.))
+  
+  if (nrow(temp) < 50) return(-1e6)  # Need enough data
+  
+   #PREDICTIVE POWER (50% weight)
+
+  # MACD signal: +1 when bullish, -1 when bearish
+  temp <- temp %>%
+    mutate(macd_signal = ifelse(macd > signal, 1, -1))
+  
+  # RSI signal: +1 when oversold, -1 when overbought, 0 neutral
+  temp <- temp %>%
+    mutate(rsi_signal = ifelse(rsi < 30, 1, 
+                        ifelse(rsi > 70, -1, 0)))
+  
+  # Correlation with future returns (how predictive?)
+  macd_correlation <- cor(temp$macd_signal, temp$future_return, 
+                          use = "complete.obs")
+  rsi_correlation <- cor(temp$rsi_signal, temp$future_return, 
+                         use = "complete.obs")
+  
+  if (is.na(macd_correlation)) macd_correlation <- 0
+  if (is.na(rsi_correlation)) rsi_correlation <- 0
+  
+  predictive_power <- abs(macd_correlation) + abs(rsi_correlation)
+  
+  #SIGNAL QUALITY (30% weight)
+
+  # Penalize noisy signals (too many crossovers/changes)
+  macd_crossovers <- sum(diff(temp$macd_signal) != 0, na.rm = TRUE)
+  rsi_changes <- sum(diff(temp$rsi_signal) != 0, na.rm = TRUE)
+  
+  # Normalize: fewer changes = better quality
+  signal_quality <- 1 / (1 + (macd_crossovers + rsi_changes) / nrow(temp))
+  
+  # SIMPLE TRADING PERFORMANCE (20% weight)
+
+  # Combined signal: average of MACD and RSI
+  temp <- temp %>%
+    mutate(
+      combined_signal = (macd_signal + rsi_signal) / 2,
+      position = ifelse(combined_signal > 0.3, 1, 
+                 ifelse(combined_signal < -0.3, 0, NA))
+    )
+  
+  temp$position <- zoo::na.locf(temp$position, na.rm = FALSE)
+  temp$position[is.na(temp$position)] <- 0
+  
+  # Calculate returns with transaction costs
+  temp <- temp %>%
+    mutate(
+      position_change = abs(c(0, diff(position))),
+      transaction_cost = position_change * 0.001,  # 0.1% per trade
+      strategy_return = lag(position, default = 0) * simple_return - transaction_cost
+    )
+  
+  equity_curve <- cumprod(1 + temp$strategy_return)
+  
+  if (length(equity_curve) > 0 && !any(is.na(equity_curve))) {
+    annual_return <- (tail(equity_curve, 1))^(252 / nrow(temp)) - 1
+    volatility <- sd(temp$strategy_return, na.rm = TRUE) * sqrt(252)
+    
+    if (!is.na(volatility) && volatility > 0) {
+      simple_sharpe <- annual_return / volatility
+    } else {
+      simple_sharpe <- 0
+    }
+  } else {
+    simple_sharpe <- 0
+  }
+  
+  # COMBINED FITNESS
+  fitness_score <- (0.50 * predictive_power +# Predictive power
+                   0.30 * signal_quality +# Signal quality
+                   0.20 * simple_sharpe)# Trading performance
+  
+  return(as.numeric(fitness_score))
+}
+
+# Run combined GA
+set.seed(42)
+
+ga_combined <- ga(
+  type = "real-valued",
+  fitness = fitness_combined_predictive,
+  lower = c(5,  20, 4,  10),   # [macd_fast, macd_slow, macd_sig, rsi_n]
+  upper = c(15, 35, 12, 25),
+  popSize = 50,
+  maxiter = 50,
+  run = 20,
+  pmutation = 0.15,
+  parallel = FALSE 
+)
+
+# Extract best parameters
+best_params <- as.numeric(round(ga_combined@solution[1, ]))
+
+best_result <- data.frame(
+  macd_fast = best_params[1],
+  macd_slow = best_params[2],
+  macd_sig = best_params[3],
+  rsi_period = best_params[4],
+  fitness = as.numeric(ga_combined@fitnessValue),
+  row.names = NULL
+)
+
+print(best_result)
+
+# Compare with standard parameters
+standard_params <- c(12, 26, 9, 14)
+standard_fitness <- fitness_combined_predictive(standard_params)
+
+cat("COMPARISON\n")
+cat("Standard params (12,26,9,14) fitness:", standard_fitness, "\n")
+cat("Optimized params fitness:", ga_combined@fitnessValue, "\n")
+cat("Improvement:", sprintf("%.2f%%", (ga_combined@fitnessValue - standard_fitness) / abs(standard_fitness) * 100),"\n")
+ 
+data_features <- add_rsi_feature(
+  df = data_features,
+  price_col = "adjusted",
+  period = best_result$rsi_period
+)
+
+data_features <- add_macd_feature(
+  df = data_features,
+  price_col = "adjusted",
+  fast = best_result$macd_fast,
+  slow = best_result$macd_slow,
+  sig = best_result$macd_sig
+)
+```
+
+
+```{r include=FALSE}
+colSums(is.na(data_features))
+
+data_features <- data_features %>%
+  filter(complete.cases(.))
+
+```
+
+
+```{r include=FALSE}
+n_total <- nrow(data_features)
+train_size <- floor(train_ratio * n_total)
+
+train_data_optimised <- data_features[1:train_size, ]
+test_data_optimised <- data_features[(train_size + 1):n_total, ]
+```
+
+
+```{r include=FALSE}
+cat("Total rows:", n_total, "\n")
+cat("Training rows:", nrow(train_data_optimised), "\n")
+cat("Testing rows:", nrow(test_data_optimised), "\n")
+cat("Training start date:", min(train_data_optimised$date), "\n")
+cat("Training end date:", max(train_data_optimised$date), "\n")
+cat("Testing start date:", min(test_data_optimised$date), "\n")
+cat("Testing end date:", max(test_data_optimised$date), "\n")
+```
+
+#Preview for train and test data, along with GA optimised indicators
+```{r}
+head(train_data_optimised)
+tail(train_data_optimised)
+
+head(test_data_optimised)
+tail(test_data_optimised)
+```
+
+#Modelling using LSTM
+
+```{r include=FALSE}
+train_raw <- train_data_optimised
+test_raw  <- test_data_optimised
+
+cat("Training rows:", nrow(train_raw), "\n")
+cat("Testing rows:", nrow(test_raw))
+
+```
+# Feature selection
+Some of the features seemed redundant and could negatively impact the model. We
+select ones based on performs of the model
+
+# Momentum
+rsi, macd, hist
+# Trends
+ema spread, price_change
+# Volatility
+high_low_range, open_close_range
+# Returns
+log_return (stationary; Colah 2015 §3 requires stable inputs so the tanh / 
+sigmoid gates aren't chronically saturated)
+# Volume
+volume_millions for supply/demand
+
+```{r}
+feature_cols <- c(
+  "log_return",       # stationary price change
+  paste0("rsi_", best_result$rsi),           # momentum oscillator [0–100]
+  paste0("macd_", best_result$macd_fast ,"_",best_result$macd_slow,"_",best_result$macd_sig),     # trend-momentum
+  paste0("hist_", best_result$macd_fast,"_",best_result$macd_slow,"_",best_result$macd_sig),     # MACD histogram  (momentum acceleration)
+  "ema",            # fast trend
+  "price_change",     # raw day-over-day change
+  "high_low_range",   # intraday volatility
+  "open_close_range", # intraday direction
+  "volume_millions"   # volume context
+)
+
+n_features <- length(feature_cols)
+
+```
+
+print(feature_cols)
+
+# Target: Next Day Closing Price
+The target for each day is the actual closing price of the following trading day.
+This turns the problem into a regression task: the model must output a continuous
+price value rather than a discrete class label.
+
+The last row of each split has no knowable next day close, so its dropped.
+
+```{r}
+make_targets <- function(df) {
+  # shifts the close up by one row
+  target <- c(df$close[-1], NA) 
+  target
+}
+
+train_raw$target <- make_targets(train_raw)
+test_raw$target  <- make_targets(test_raw)
+
+# Drop the final row in each split
+train_df <- train_raw[!is.na(train_raw$target), ]
+test_df  <- test_raw [!is.na(test_raw$target),  ]
+
+cat("Training rows:", nrow(train_df), "\n")
+cat("Testing rows:", nrow(test_df), "\n")
+
+```
+
+# Normalisation
+We scale the features to -1 to 1 using min-max scaling fitted on the training
+data only, to prevent look ahead bias.
+
+The target (next day close) is also scaled using the training close range so
+that predictions can be inverted back to real prices at evaluation.
+
+```{r include=FALSE}
+# Feature scaling parameters (fitted on training data only)
+scale_params <- lapply(feature_cols, function(col) {
+  list(mn = min(train_df[[col]], na.rm = TRUE),
+       mx = max(train_df[[col]], na.rm = TRUE))
+})
+names(scale_params) <- feature_cols
+
+scale_df <- function(df) {
+  out <- df
+  
+  for (col in feature_cols) {
+    mn    <- scale_params[[col]]$mn
+    mx    <- scale_params[[col]]$mx
+    range <- mx - mn
+
+    out[[col]] <- if (range == 0) {
+      0
+    } else {
+      2 * (df[[col]] - mn) / range - 1
+    }
+  }
+  out
+}
+
+# Target scaling parameters, fitted on training close
+target_mn <- min(train_df$target, na.rm = TRUE)
+target_mx <- max(train_df$target, na.rm = TRUE)
+target_r  <- target_mx - target_mn
+
+scale_target   <- function(y) 2 * (y - target_mn) / target_r - 1
+unscale_target <- function(y) (y + 1) / 2 * target_r + target_mn
+
+train_sc <- scale_df(train_df)
+test_sc  <- scale_df(test_df)
+
+train_sc$target_sc <- scale_target(train_sc$target)
+test_sc$target_sc  <- scale_target(test_sc$target)
+```
+
+# Sliding-window sequences
+RNNs operate over sequences (Karpathy). Lookback 10 is 10 trading days,
+roughly two trading weeks, providing the LSTM with a focused short term
+context to capture recent momentum shifts in RSI and EMA. Standard RNNs
+fail at long term memory (Colah); the LSTM gated cell state is designed
+to carry signals such as an emerging RSI crossover across the 10 day
+window without vanishing. A shorter window reduces Backpropagation
+Through Time (BPTT) depth, lowering the risk of vanishing gradients
+while retaining the most recent and relevant price signal on daily bars.
+
+```{r}
+LOOKBACK <- 10
+
+make_sequences <- function(df, lb) {
+
+  # Extract feature matrix and scaled target vector
+  feature_matrix <- as.matrix(df[, feature_cols])
+  target_vector  <- df$target_sc
+
+  # Number of sequences we can form given the lookback window
+  n_sequences <- nrow(feature_matrix) - lb
+
+  # Preallocate output arrays
+  X <- array(0, dim = c(n_sequences, lb, n_features))
+  y <- numeric(n_sequences)
+
+  # Fill each sequence: X gets a (lb x n_features) window, y gets the next target
+  for (i in seq_len(n_sequences)) {
+    window_start <- i
+    window_end   <- i + lb - 1
+
+    X[i, , ] <- feature_matrix[window_start:window_end, ]
+    y[i]     <- target_vector[window_end + 1]
+  }
+
+  list(X = X, y = y)
+}
+
+tr <- make_sequences(train_sc, LOOKBACK)
+te <- make_sequences(test_sc,  LOOKBACK)
+
+X_train <- tr$X;  y_train <- tr$y
+X_test  <- te$X;  y_test  <- te$y
+
+cat("Training sequences:", nrow(X_train), "\n")
+cat("Testing sequences:", nrow(X_test))
+
+```
+
+# Validation split
+We take the last 15% of the training sequences chronologically for validation.
+
+```{r include=FALSE}
+n_tr    <- nrow(X_train)
+val_cut <- floor(0.85 * n_tr)
+
+X_val   <- X_train[(val_cut + 1):n_tr, , ]
+y_val   <- y_train[(val_cut + 1):n_tr]
+X_train <- X_train[1:val_cut, , ]
+y_train <- y_train[1:val_cut]
+
+cat("Training sequences:", length(y_train), "\n")
+cat("Testing sequences:", length(y_val))
+
+```
+
+# Model Architecture
+Two stacked LSTM layers since deeper RNNs work better (Karpathy).
+
+# Bidirectional wrapper
+Allow the LSTM layers and processes to sequence both forwards and backwards
+
+# First LSTM layer
+64 units. Each unit maintains its own cell state (Colah), allowing the layer to
+track 64 independent aspects of the sequence and extract short-range feature
+interactions (RSI + volume spike). `return_sequences = TRUE` passes the full
+hidden state sequence to the next LSTM layer.
+
+# Dropout layers
+Dropout 0.3 randomly zeros 30% of hidden units during training, preventing the
+network from simply memorizing the training sequence.
+
+# Second LSTM layer
+32 units, forcing the network to compress its representation. This layer models
+how the first layer's features evolve across the 20-day window.
+
+# Batch normalization layer
+Normalizes the compressed LSTM output before the non linear mapping in the dense
+layer, helping gradients during backpropagation.
+ 
+# Dense layer
+Dense(16 unit, activation "relu") learns a non-linear mapping from the compressed
+LSTM output to the prediction. ReLU mitigates the vanishing gradient problem.
+
+# Output layer
+Dense(1 unit, activation "linear") outputs a single continuous value, the scaled
+next day closing price. A linear activation is used because the target is
+unbounded.
+
+
+```{r}
+set.seed(42)
+
+model <- keras_model_sequential(name = "lstm_priceprediction") |>
+  bidirectional(
+    layer_lstm(
+      units            = 64,
+      return_sequences = TRUE,
+      name             = "lstm1"
+    ),
+    input_shape = c(LOOKBACK, n_features),
+    name        = "bidirectional_1"
+  ) |>
+  layer_dropout(0.30, name = "drop1") |>
+  bidirectional(
+    layer_lstm(
+      units            = 32,
+      return_sequences = FALSE,
+      name             = "lstm2"
+    ),
+    name = "bidirectional_2"
+  ) |>
+  layer_dropout(0.30, name = "drop2") |>
+  layer_batch_normalization(name = "batch_norm") |>
+  layer_dense(16, activation = "relu",   name = "dense1") |>
+  layer_dense(1,  activation = "linear", name = "output")
+
+summary(model)
+```
+
+# Compiling
+Adam adapts the learning rate per parameter using first and second moment
+estimates, which suits LSTM gate weights with very different gradient
+magnitudes. Learning rate of 0.0005 prevents the forget gate from over correcting
+on noisy stock data.
+
+Mean Absolute Error (MAE) is used as the loss function because it is expressed
+in the same units as the scaled price, is robust to outlier days, and gives an
+intuitive reading of average prediction error.
+
+```{r}
+model |> compile(
+  optimizer = optimizer_adam(learning_rate = 0.0005),
+  loss      = "mae",
+  metrics   = list("mae")
+)
+```
+
+# Callbacks
+WE implement early stopping because LSTMs can over fit by memorizing the 
+training sequence. We monitor validation loss and stop training if it hasn't
+improved for 30 consecutive epochs, then restore weights from the best epoch.
+We reduce the learning rate if it platues for 5 epochs by half which
+should help the optimizer escape shallow local minima on the regression loss 
+surface.
+
+```{r}
+cbs <- list(
+  callback_early_stopping(
+    monitor              = "val_loss",
+    patience             = 30,
+    restore_best_weights = TRUE,
+    verbose              = 1
+  ),
+  callback_reduce_lr_on_plateau(
+    monitor  = "val_loss",
+    factor   = 0.5,
+    patience = 5,
+    min_lr   = 0.000001,
+    verbose  = 1
+  )
+)
+```
+
+# Training — Round 1 (train split)
+Batch size 16 balances gradient noise and generalization. The model is trained
+on the training sequences only, with the validation split used for early
+stopping and learning rate scheduling.
+
+```{r}
+set.seed(42)
+history <- model |> fit(
+  x               = X_train,
+  y               = y_train,
+  epochs          = 100,
+  batch_size      = 16,
+  validation_data = list(X_val, y_val),
+  callbacks       = cbs,
+  verbose         = 1
+)
+```
+
+# Training curves
+
+```{r echo=FALSE}
+hist_df <- data.frame(
+  epoch   = seq_along(history$metrics$loss),
+  tr_loss = history$metrics$loss,
+  vl_loss = history$metrics$val_loss
+)
+
+p_loss <- ggplot(hist_df, aes(epoch)) +
+  geom_line(aes(y = tr_loss, colour = "Train"),      linewidth = 0.8) +
+  geom_line(aes(y = vl_loss, colour = "Validation"), linewidth = 0.8) +
+  scale_colour_manual(values = c(Train = "steelblue", Validation = "red")) +
+  labs(title = "MAE Loss Round 1: Train vs Validation",
+       x = "Epoch", y = "MAE scaled", colour = NULL) +
+  theme_minimal()
+print(p_loss)
+```
+
+# Round 1 Test evaluation
+After Round 1 training, we evaluate on the held out test sequences. Predictions
+are inverted from the scaled space back to actual closing prices for
+interpretation.
+
+```{r echo=FALSE}
+pred_test_sc <- as.vector(predict(model, X_test))
+pred_test    <- unscale_target(pred_test_sc)
+actual_test  <- unscale_target(y_test)
+
+mae_test  <- mean(abs(pred_test - actual_test))
+rmse_test <- sqrt(mean((pred_test - actual_test)^2))
+
+cat("Round 1 Test MAE:", mae_test, "\n")
+cat("Round 1 Test RMSE:", rmse_test)
+
+# Plot predicted vs actual
+test_dates <- test_sc$date[(LOOKBACK + 1):nrow(test_sc)]
+plot_df <- data.frame(
+  date   = test_dates,
+  actual = actual_test,
+  pred   = pred_test
+)
+
+ggplot(plot_df, aes(x = date)) +
+  geom_line(aes(y = actual, colour = "Actual"),    linewidth = 0.7) +
+  geom_line(aes(y = pred,   colour = "Predicted"), linewidth = 0.7, linetype = "dashed") +
+  scale_colour_manual(values = c(Actual = "steelblue", Predicted = "red")) +
+  labs(title = "Round 1: Predicted vs Actual Next Day Close (Test Set)",
+       x = "Date", y = "Close Price ($)", colour = NULL) +
+  theme_minimal()
+```
+
+# Round 2: Retraining on Training + Validation combined
+After confirming model quality in Round 1, we retrain on the full training and
+validation data combined, using the optimal number of epochs found during
+Round 1 (ie the epoch at which early stopping restored best weights).
+This maximizes the data available before the final test evaluation, which is
+good practice in time series modelling.
+
+```{r include=FALSE}
+# Combine train and validation sequences
+X_trainval <- abind::abind(X_train, X_val, along = 1)
+y_trainval  <- c(y_train, y_val)
+
+# Determine the best epoch from Round 1
+best_epoch <- which.min(history$metrics$val_loss)
+cat("Best epoch from Round 1:", best_epoch)
+```
+
+# Reinitialise model for Round 2
+We build an identical architecture and compile it fresh so that Round 2 starts
+from random weights, avoiding any bias from Round 1's trained state.
+
+```{r}
+set.seed(42)
+model2 <- keras_model_sequential(name = "lstm_priceprediction") |>
+  bidirectional(
+    layer_lstm(
+      units            = 64,
+      return_sequences = TRUE,
+      name             = "lstm1"
+    ),
+    input_shape = c(LOOKBACK, n_features),
+    name        = "bidirectional1"
+  ) |>
+  layer_dropout(0.30, name = "drop1") |>
+  bidirectional(
+    layer_lstm(
+      units            = 32,
+      return_sequences = FALSE,
+      name             = "lstm2"
+    ),
+    name = "bidirectional2"
+  ) |>
+  layer_dropout(0.30, name = "drop2") |>
+  layer_batch_normalization(name = "batch_norm") |>
+  layer_dense(16, activation = "relu",   name = "dense1") |>
+  layer_dense(1,  activation = "linear", name = "output")
+model2 |> compile(
+  optimizer = optimizer_adam(learning_rate = 0.0005),
+  loss      = "mae",
+  metrics   = list("mae")
+)
+
+summary(model2)
+```
+
+# Training — Round 2 (train + validation combined)
+We train for exactly `best_epoch` epochs (no early stopping needed, as the
+optimal stopping point was already determined in Round 1).
+
+```{r}
+set.seed(42)
+history2 <- model2 |> fit(
+  x          = X_trainval,
+  y          = y_trainval,
+  epochs     = best_epoch,
+  batch_size = 16,
+  verbose    = 1
+)
+```
+
+# Round 2 Training curves
+
+```{r echo=FALSE}
+hist2_df <- data.frame(
+  epoch   = seq_along(history2$metrics$loss),
+  tr_loss = history2$metrics$loss
+)
+
+ggplot(hist2_df, aes(x = epoch, y = tr_loss)) +
+  geom_line(colour = "steelblue", linewidth = 0.8) +
+  labs(title = "MAE Loss Round 2: Training + Validation Combined",
+       x = "Epoch", y = "MAE (scaled)") +
+  theme_minimal()
+```
+
+# Round 2 Test evaluation
+We evaluate the Round 2 model on the same held-out test sequences and compare
+performance against Round 1.
+
+```{r echo=FALSE}
+#to be used in ga
+pred_test2_sc <- as.vector(predict(model2, X_test))
+pred_test2    <- unscale_target(pred_test2_sc)
+
+mae_test2  <- mean(abs(pred_test2 - actual_test))
+rmse_test2 <- sqrt(mean((pred_test2 - actual_test)^2))
+
+cat("Round 2 Test MAE:", mae_test2, "\n")
+cat("Round 2 Test RMSE:", rmse_test2)
+
+# Summary comparison
+cat("\nRound one comparrison\n")
+
+cat("Round 1 Test MAE:", mae_test, "\n")
+cat("Round 1 Test RMSE:", rmse_test)
+ 
+# Plot Round 2 predicted vs actual
+plot_df2 <- data.frame(
+  date   = test_dates,
+  actual = actual_test,
+  r1     = pred_test,
+  r2     = pred_test2
+)
+
+ggplot(plot_df2, aes(x = date)) +
+  geom_line(aes(y = actual, colour = "Actual"),   linewidth = 0.7) +
+  geom_line(aes(y = r1,     colour = "Round 1"),  linewidth = 0.7, linetype = "dashed") +
+  # geom_line(aes(y = r2,     colour = "Round 2"),  linewidth = 0.7, linetype = "dotted") +
+  geom_line(aes(y = r2,     colour = "Round 2"),  linewidth = 0.7) +
+
+  scale_colour_manual(values = c("Actual"  = "steelblue",
+                                 "Round 1" = "red",
+                                 "Round 2" = "darkgreen")) +
+  labs(title = "Round 1 vs Round 2: Predicted vs Actual Next Day Close",
+       x = "Date", y = "Close Price ($)", colour = NULL) +
+  theme_minimal()
+```
+
+# Attaching predictions to test_raw
+
+We attach the Round 1 predictions, Round 2 predictions, and the actual next day
+close back to test_raw so that the full enriched dataset is available in one
+place for downstream analysis, backtesting, and reporting.
+
+The LSTM predicts the next day close for each row in the test window. Each
+predicted value corresponds to the row that is LOOKBACK + 1 steps ahead of
+the first test row, so we reconstruct the matching dates from test_sc and
+then left join onto test_raw
+
+```{r include=FALSE}
+# dates that correspond to each test prediction
+pred_dates <- test_sc$date[(LOOKBACK + 1):nrow(test_sc)]
+
+# Build a look up table with all three columns
+pred_lookup <- data.frame(
+  date          = pred_dates,
+  pred_round1   = pred_test,
+  pred_round2   = pred_test2,
+  actual_next_close = actual_test
+)
+
+# Left join onto test_raw
+test_raw <- test_raw %>%
+  left_join(pred_lookup, by = "date")
+
+head(test_raw)
+tail(test_raw)
+```
+
+#Evaluation and Backtesting
+
+1. Prediction-Based Trading Strategy:
+
+This function executes a trading strategy based on price predictions. It compares the predicted price with the current closing price to generate buy/sell/hold signals.
+
+```{r prediction-strategy-function}
+#' Execute Trading Strategy Based on Predictions
+
+execute_prediction_strategy <- function(data, buy_threshold = 0.02, sell_threshold = 0.02,initial_capital = 10000, transaction_cost = 0.001) {
+  
+  n <- nrow(data)
+  
+  # Initialize tracking vectors
+  decision <- integer(n)          # 1=buy, -1=sell, 0=hold
+  shares_held <- numeric(n)       # Number of shares held
+  cash <- numeric(n)              # Cash available
+  portfolio_value <- numeric(n)  # Total portfolio value
+  
+  # Starting conditions
+  cash[1] <- initial_capital
+  shares_held[1] <- 0
+  portfolio_value[1] <- initial_capital
+  
+  # Track all transactions
+  transactions <- data.frame(
+    Day = integer(),
+    Action = character(),
+    Price = numeric(),
+    Shares = numeric(),
+    Cost = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Iterate through each trading day
+  for (i in 1:(n-1)) {
+    
+    if (is.na(data$Close[i]) || is.na(data$Predicted[i]) || is.na(data$Open[i+1])) {
+      decision[i] <- 0
+      shares_held[i+1] <- shares_held[i]
+      cash[i+1] <- cash[i]
+      portfolio_value[i+1] <- cash[i+1] + shares_held[i+1] * data$Close[i+1]
+      next
+    }
+    
+    # Generate trading signal
+    current_price <- data$Close[i]
+    predicted_price <- data$Predicted[i]
+    next_open <- data$Open[i+1]
+    
+    signal <- 0
+    
+    # BUY signal: prediction significantly higher than current price
+    if (predicted_price > (1 + buy_threshold) * current_price) {
+      signal <- 1
+    } 
+    # SELL signal: prediction significantly lower than current price
+    else if (predicted_price < (1 - sell_threshold) * current_price) {
+      signal <- -1
+    }
+    
+    # Execute trade (trades happen at next day's opening price)
+    executed_signal <- 0
+    
+    # BUY: Only if we have cash and aren't fully invested
+    if (signal == 1 && cash[i] > 0) {
+      # Calculate how many shares we can buy
+      shares_to_buy <- floor(cash[i] / (next_open * (1 + transaction_cost)))
+      
+      if (shares_to_buy > 0) {
+        cost <- shares_to_buy * next_open * (1 + transaction_cost)
+        cash[i+1] <- cash[i] - cost
+        shares_held[i+1] <- shares_held[i] + shares_to_buy
+        executed_signal <- 1
+        
+        # Record transaction
+        transactions <- rbind(transactions, data.frame(
+          Day = i+1,
+          Action = "BUY",
+          Price = next_open,
+          Shares = shares_to_buy,
+          Cost = cost
+        ))
+      } else {
+        cash[i+1] <- cash[i]
+        shares_held[i+1] <- shares_held[i]
+      }
+    }
+    # SELL: Only if we have shares to sell
+    else if (signal == -1 && shares_held[i] > 0) {
+      # Sell all shares
+      shares_to_sell <- shares_held[i]
+      proceeds <- shares_to_sell * next_open * (1 - transaction_cost)
+      
+      cash[i+1] <- cash[i] + proceeds
+      shares_held[i+1] <- 0
+      executed_signal <- -1
+      
+      # Record transaction
+      transactions <- rbind(transactions, data.frame(
+        Day = i+1,
+        Action = "SELL",
+        Price = next_open,
+        Shares = shares_to_sell,
+        Cost = -proceeds
+      ))
+    }
+    # HOLD
+    else {
+      cash[i+1] <- cash[i]
+      shares_held[i+1] <- shares_held[i]
+    }
+    
+    decision[i] <- executed_signal
+    
+    # Calculate portfolio value
+    if (!is.na(data$Close[i+1])) {
+      portfolio_value[i+1] <- cash[i+1] + shares_held[i+1] * data$Close[i+1]
+    } else {
+      portfolio_value[i+1] <- portfolio_value[i]
+    }
+  }
+  
+  # Last day: close any open positions
+  if (shares_held[n-1] > 0 && !is.na(data$Close[n])) {
+    proceeds <- shares_held[n-1] * data$Close[n] * (1 - transaction_cost)
+    cash[n] <- cash[n-1] + proceeds
+    shares_held[n] <- 0
+    decision[n] <- -1
+    
+    transactions <- rbind(transactions, data.frame(
+      Day = n,
+      Action = "SELL (Close)",
+      Price = data$Close[n],
+      Shares = shares_held[n-1],
+      Cost = -proceeds
+    ))
+  } else {
+    cash[n] <- cash[n-1]
+    shares_held[n] <- shares_held[n-1]
+    decision[n] <- 0
+  }
+  
+  portfolio_value[n] <- cash[n] + shares_held[n] * data$Close[n]
+  
+  # Return results
+  return(list(
+    decision = decision,
+    shares_held = shares_held,
+    cash = cash,
+    portfolio_value = portfolio_value,
+    transactions = transactions,
+    final_value = portfolio_value[n],
+    initial_capital = initial_capital
+  ))
+}
+```
+
+2. Buy & Hold Strategy:
+
+A classic benchmark strategy: buy at the beginning and hold until the end.
+
+```{r buyhold-function}
+#' Buy and Hold Strategy
+
+execute_buy_hold <- function(data, initial_capital = 10000, transaction_cost = 0.001) {
+  
+  n <- nrow(data)
+  
+  # Buy on day 1 at opening price
+  first_open <- data$Open[1]
+  shares_bought <- floor(initial_capital / (first_open * (1 + transaction_cost)))
+  cost <- shares_bought * first_open * (1 + transaction_cost)
+  remaining_cash <- initial_capital - cost
+  
+  # Track portfolio value over time
+  portfolio_value <- numeric(n)
+  shares_held <- rep(shares_bought, n)
+  cash <- rep(remaining_cash, n)
+  
+  for (i in 1:n) {
+    if (!is.na(data$Close[i])) {
+      portfolio_value[i] <- remaining_cash + shares_bought * data$Close[i]
+    } else {
+      portfolio_value[i] <- if(i > 1) portfolio_value[i-1] else initial_capital
+    }
+  }
+  
+  # Sell on last day
+  final_proceeds <- shares_bought * data$Close[n] * (1 - transaction_cost)
+  final_value <- remaining_cash + final_proceeds
+  
+  return(list(
+    shares_held = shares_held,
+    cash = cash,
+    portfolio_value = portfolio_value,
+    final_value = final_value,
+    initial_capital = initial_capital,
+    transactions = data.frame(
+      Day = c(1, n),
+      Action = c("BUY", "SELL"),
+      Price = c(first_open, data$Close[n]),
+      Shares = c(shares_bought, shares_bought),
+      Cost = c(-cost, final_proceeds)
+    )
+  ))
+}
+```
+
+3. Random Trading Strategy:
+
+A baseline strategy that makes random buy/sell decisions to validate that your strategy has genuine skill.
+
+```{r random-strategy-function}
+#' Random Trading Strategy (for comparison)
+
+execute_random_strategy <- function(data, initial_capital = 10000, trade_probability = 0.1,transaction_cost = 0.001, seed = 42) {
+  
+  set.seed(seed)
+  n <- nrow(data)
+  
+  # Initialize
+  decision <- integer(n)
+  shares_held <- numeric(n)
+  cash <- numeric(n)
+  portfolio_value <- numeric(n)
+  
+  cash[1] <- initial_capital
+  shares_held[1] <- 0
+  portfolio_value[1] <- initial_capital
+  
+  transactions <- data.frame(
+    Day = integer(),
+    Action = character(),
+    Price = numeric(),
+    Shares = numeric(),
+    Cost = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:(n-1)) {
+    
+    if (is.na(data$Open[i+1]) || is.na(data$Close[i+1])) {
+      decision[i] <- 0
+      shares_held[i+1] <- shares_held[i]
+      cash[i+1] <- cash[i]
+      portfolio_value[i+1] <- portfolio_value[i]
+      next
+    }
+    
+    # Random decision
+    if (runif(1) < trade_probability) {
+      signal <- sample(c(-1, 1), 1)  # Randomly buy or sell
+    } else {
+      signal <- 0
+    }
+    
+    next_open <- data$Open[i+1]
+    
+    # Execute BUY
+    if (signal == 1 && cash[i] > 0) {
+      shares_to_buy <- floor(cash[i] / (next_open * (1 + transaction_cost)))
+      
+      if (shares_to_buy > 0) {
+        cost <- shares_to_buy * next_open * (1 + transaction_cost)
+        cash[i+1] <- cash[i] - cost
+        shares_held[i+1] <- shares_held[i] + shares_to_buy
+        decision[i] <- 1
+        
+        transactions <- rbind(transactions, data.frame(
+          Day = i+1, Action = "BUY", Price = next_open,
+          Shares = shares_to_buy, Cost = cost
+        ))
+      } else {
+        cash[i+1] <- cash[i]
+        shares_held[i+1] <- shares_held[i]
+      }
+    }
+    # Execute SELL
+    else if (signal == -1 && shares_held[i] > 0) {
+      shares_to_sell <- shares_held[i]
+      proceeds <- shares_to_sell * next_open * (1 - transaction_cost)
+      
+      cash[i+1] <- cash[i] + proceeds
+      shares_held[i+1] <- 0
+      decision[i] <- -1
+      
+      transactions <- rbind(transactions, data.frame(
+        Day = i+1, Action = "SELL", Price = next_open,
+        Shares = shares_to_sell, Cost = -proceeds
+      ))
+    }
+    # HOLD
+    else {
+      cash[i+1] <- cash[i]
+      shares_held[i+1] <- shares_held[i]
+      decision[i] <- 0
+    }
+    
+    portfolio_value[i+1] <- cash[i+1] + shares_held[i+1] * data$Close[i+1]
+  }
+  
+  # Close position on last day
+  if (shares_held[n-1] > 0) {
+    proceeds <- shares_held[n-1] * data$Close[n] * (1 - transaction_cost)
+    cash[n] <- cash[n-1] + proceeds
+    shares_held[n] <- 0
+    decision[n] <- -1
+  } else {
+    cash[n] <- cash[n-1]
+    shares_held[n] <- shares_held[n-1]
+    decision[n] <- 0
+  }
+  
+  portfolio_value[n] <- cash[n] + shares_held[n] * data$Close[n]
+  
+  return(list(
+    decision = decision,
+    shares_held = shares_held,
+    cash = cash,
+    portfolio_value = portfolio_value,
+    transactions = transactions,
+    final_value = portfolio_value[n],
+    initial_capital = initial_capital
+  ))
+}
+```
+
+#Performance Metrics
+
+Calculating Performance Metrics:
+
+This function calculates performance metrics including returns, volatility, Sharpe ratio, maximum drawdown, and trading statistics.
+
+```{r performance-metrics-function}
+#' Calculate Comprehensive Performance Metrics
+
+calculate_performance_metrics <- function(portfolio_value, 
+                                         initial_capital, 
+                                         transactions,
+                                         risk_free_rate = 0.02) {
+  
+  # Total Return
+  final_value <- tail(portfolio_value, 1)
+  total_return <- (final_value - initial_capital) / initial_capital
+  total_return_pct <- total_return * 100
+  
+  # Annualized Return (assuming 252 trading days per year)
+  n_days <- length(portfolio_value)
+  years <- n_days / 252
+  annualized_return <- (final_value / initial_capital)^(1/years) - 1
+  annualized_return_pct <- annualized_return * 100
+  
+  # Daily Returns
+  daily_returns <- diff(portfolio_value) / head(portfolio_value, -1)
+  daily_returns[is.infinite(daily_returns)] <- 0
+  daily_returns[is.nan(daily_returns)] <- 0
+  
+  # Volatility (annualized)
+  volatility <- sd(daily_returns, na.rm = TRUE) * sqrt(252)
+  volatility_pct <- volatility * 100
+  
+  # Sharpe Ratio
+  daily_rf <- (1 + risk_free_rate)^(1/252) - 1
+  excess_returns <- daily_returns - daily_rf
+  sharpe_ratio <- mean(excess_returns, na.rm = TRUE) / sd(excess_returns, na.rm = TRUE) * sqrt(252)
+  
+  # Maximum Drawdown
+  cummax_value <- cummax(portfolio_value)
+  drawdown <- (portfolio_value - cummax_value) / cummax_value
+  max_drawdown <- min(drawdown, na.rm = TRUE)
+  max_drawdown_pct <- max_drawdown * 100
+  
+  # Win Rate (for strategies with transactions)
+  if (nrow(transactions) > 0) {
+    # Pair buy and sell transactions
+    buys <- transactions[transactions$Action %in% c("BUY"), ]
+    sells <- transactions[transactions$Action %in% c("SELL", "SELL (Close)"), ]
+    
+    if (nrow(buys) > 0 && nrow(sells) > 0) {
+      n_trades <- min(nrow(buys), nrow(sells))
+      
+      if (n_trades > 0) {
+        profits <- numeric(n_trades)
+        for (i in 1:n_trades) {
+          buy_cost <- buys$Cost[i]
+          sell_proceeds <- -sells$Cost[i]  # Negative because proceeds are stored as negative cost
+          profits[i] <- sell_proceeds - buy_cost
+        }
+        
+        winning_trades <- sum(profits > 0)
+        win_rate <- winning_trades / n_trades
+        win_rate_pct <- win_rate * 100
+        avg_win <- mean(profits[profits > 0])
+        avg_loss <- mean(profits[profits < 0])
+        profit_factor <- ifelse(length(profits[profits < 0]) > 0,
+                               sum(profits[profits > 0]) / abs(sum(profits[profits < 0])),
+                               Inf)
+      } else {
+        win_rate_pct <- NA
+        avg_win <- NA
+        avg_loss <- NA
+        profit_factor <- NA
+        n_trades <- 0
+      }
+    } else {
+      win_rate_pct <- NA
+      avg_win <- NA
+      avg_loss <- NA
+      profit_factor <- NA
+      n_trades <- 0
+    }
+  } else {
+    win_rate_pct <- NA
+    avg_win <- NA
+    avg_loss <- NA
+    profit_factor <- NA
+    n_trades <- 0
+  }
+  
+  # Return metrics as list
+  return(list(
+    final_value = final_value,
+    total_return = total_return,
+    total_return_pct = total_return_pct,
+    annualized_return = annualized_return,
+    annualized_return_pct = annualized_return_pct,
+    volatility = volatility,
+    volatility_pct = volatility_pct,
+    sharpe_ratio = sharpe_ratio,
+    max_drawdown = max_drawdown,
+    max_drawdown_pct = max_drawdown_pct,
+    win_rate_pct = win_rate_pct,
+    number_of_trades = n_trades,
+    avg_win = avg_win,
+    avg_loss = avg_loss,
+    profit_factor = profit_factor
+  ))
+}
+```
+
+#Comparison & Visualization Multiple Strategies
+
+```{r compare-strategies-function, include=FALSE}
+#' Compare Multiple Strategies
+
+compare_strategies <- function(strategies_list, strategy_names) {
+  
+  comparison_df <- data.frame(
+    Strategy = strategy_names,
+    Final_Value = numeric(length(strategies_list)),
+    Total_Return_Pct = numeric(length(strategies_list)),
+    Annualized_Return_Pct = numeric(length(strategies_list)),
+    Volatility_Pct = numeric(length(strategies_list)),
+    Sharpe_Ratio = numeric(length(strategies_list)),
+    Max_Drawdown_Pct = numeric(length(strategies_list)),
+    Win_Rate_Pct = numeric(length(strategies_list)),
+    Number_of_Trades = integer(length(strategies_list)),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:length(strategies_list)) {
+    metrics <- strategies_list[[i]]$metrics
+    comparison_df$Final_Value[i] <- metrics$final_value
+    comparison_df$Total_Return_Pct[i] <- metrics$total_return_pct
+    comparison_df$Annualized_Return_Pct[i] <- metrics$annualized_return_pct
+    comparison_df$Volatility_Pct[i] <- metrics$volatility_pct
+    comparison_df$Sharpe_Ratio[i] <- metrics$sharpe_ratio
+    comparison_df$Max_Drawdown_Pct[i] <- metrics$max_drawdown_pct
+    comparison_df$Win_Rate_Pct[i] <- metrics$win_rate_pct
+    comparison_df$Number_of_Trades[i] <- metrics$number_of_trades
+  }
+  
+  return(comparison_df)
+}
+```
+
+
+```{r visualization-functions, echo=FALSE}
+#' Create Visualization of Strategy Performance
+
+plot_strategy_comparison <- function(data, strategies_list, strategy_names) {
+  
+  # Prepare data for plotting
+  n <- nrow(data)
+  
+  plot_data <- data.frame(
+    Day = rep(1:n, length(strategies_list)),
+    Portfolio_Value = unlist(lapply(strategies_list, function(x) x$portfolio_value)),
+    Strategy = rep(strategy_names, each = n)
+  )
+  
+  # Portfolio value over time
+  p1 <- ggplot(plot_data, aes(x = Day, y = Portfolio_Value, color = Strategy, linetype = Strategy)) +
+    geom_line(size = 1) +
+    geom_hline(yintercept = strategies_list[[1]]$initial_capital, linetype = "dashed", color = "gray50") +
+    labs(
+      title = "Portfolio Value Over Time",
+      subtitle = paste0("Initial Capital: £", format(strategies_list[[1]]$initial_capital, big.mark = ",")),
+      x = "Trading Day",
+      y = "Portfolio Value (£)"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10)
+    ) +
+    scale_y_continuous(labels = scales::comma)
+  
+  return(p1)
+}
+
+#' Create Returns Distribution Plot
+#' 
+#' @param strategies_list List of strategy results
+#' @param strategy_names Vector of strategy names
+#' @return ggplot object
+plot_returns_distribution <- function(strategies_list, strategy_names) {
+  
+  # Calculate daily returns for each strategy
+  returns_data <- data.frame()
+  
+  for (i in 1:length(strategies_list)) {
+    pv <- strategies_list[[i]]$portfolio_value
+    returns <- diff(pv) / head(pv, -1)
+    returns[is.infinite(returns)] <- 0
+    returns[is.nan(returns)] <- 0
+    
+    temp_df <- data.frame(
+      Returns = returns * 100,  # Convert to percentage
+      Strategy = strategy_names[i]
+    )
+    returns_data <- rbind(returns_data, temp_df)
+  }
+  
+  p2 <- ggplot(returns_data, aes(x = Returns, fill = Strategy)) +
+    geom_density(alpha = 0.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      title = "Daily Returns Distribution",
+      x = "Daily Return (%)",
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold", size = 14)
+    )
+  
+  return(p2)
+}
+```
+
+#Main Backtesting Function
+
+This Runs the entire backtesting process, running all strategies and generating comparisons.
+
+```{r main-backtest-function}
+run_complete_backtest <- function(test_data,initial_capital = 10000,buy_threshold = 0.02,sell_threshold = 0.02,transaction_cost = 0.001, risk_free_rate = 0.02) {
+  
+  cat("ALGORITHMIC TRADING BACKTESTING FRAMEWORK\n")
+  cat("Initial Capital: £", format(initial_capital, big.mark = ","), "\n")
+  cat("Test Period: ", nrow(test_data), " days\n")
+  cat("Transaction Cost: ", transaction_cost * 100, "%\n")
+  cat("Buy Threshold: ", buy_threshold * 100, "%\n")
+  cat("Sell Threshold: ", sell_threshold * 100, "%\n")
+
+  # Strategy 1: Prediction-Based Strategy
+  cat("Running Prediction-Based Strategy...\n")
+  pred_results <- execute_prediction_strategy(
+    test_data, 
+    buy_threshold, 
+    sell_threshold,
+    initial_capital, 
+    transaction_cost
+  )
+  pred_metrics <- calculate_performance_metrics(
+    pred_results$portfolio_value,
+    pred_results$initial_capital,
+    pred_results$transactions,
+    risk_free_rate
+  )
+  pred_results$metrics <- pred_metrics
+  
+  # Strategy 2: Buy & Hold
+  cat("Running Buy & Hold Strategy...\n")
+  bh_results <- execute_buy_hold(test_data, initial_capital, transaction_cost)
+  bh_metrics <- calculate_performance_metrics(
+    bh_results$portfolio_value,
+    bh_results$initial_capital,
+    bh_results$transactions,
+    risk_free_rate
+  )
+  bh_results$metrics <- bh_metrics
+  
+  # Strategy 3: Random Trading
+  cat("Running Random Trading Strategy...\n")
+  random_results <- execute_random_strategy(
+    test_data, 
+    initial_capital,
+    trade_probability = 0.1,
+    transaction_cost,
+    seed = 42
+  )
+  random_metrics <- calculate_performance_metrics(
+    random_results$portfolio_value,
+    random_results$initial_capital,
+    random_results$transactions,
+    risk_free_rate
+  )
+  random_results$metrics <- random_metrics
+  
+  # Compare Strategies
+  cat("Comparing Strategies\n")
+  strategies_list <- list(pred_results, bh_results, random_results)
+  strategy_names <- c("Prediction-Based", "Buy & Hold", "Random Trading")
+  
+  comparison <- compare_strategies(strategies_list, strategy_names)
+  
+  # Print Results
+  cat("\n")
+  cat("  PERFORMANCE COMPARISON\n")
+  print(comparison, row.names = FALSE)
+  cat("\n")
+  
+  # Print detailed metrics for prediction-based strategy
+  cat("  DETAILED METRICS: PREDICTION-BASED STRATEGY\n")
+  cat("Final Portfolio Value: £", format(pred_metrics$final_value, big.mark = ",", digits = 2, nsmall = 2), "\n")
+  cat("Total Return: ", sprintf("%.2f%%", pred_metrics$total_return_pct), "\n")
+  cat("Annualized Return: ", sprintf("%.2f%%", pred_metrics$annualized_return_pct), "\n")
+  cat("Volatility (Annual): ", sprintf("%.2f%%", pred_metrics$volatility_pct), "\n")
+  cat("Sharpe Ratio: ", sprintf("%.3f", pred_metrics$sharpe_ratio), "\n")
+  cat("Maximum Drawdown: ", sprintf("%.2f%%", pred_metrics$max_drawdown_pct), "\n")
+  cat("Number of Trades: ", pred_metrics$number_of_trades, "\n")
+  if (!is.na(pred_metrics$win_rate_pct)) {
+    cat("Win Rate: ", sprintf("%.2f%%", pred_metrics$win_rate_pct), "\n")
+    cat("Average Win: £", format(pred_metrics$avg_win, digits = 2, nsmall = 2), "\n")
+    cat("Average Loss: £", format(pred_metrics$avg_loss, digits = 2, nsmall = 2), "\n")
+    cat("Profit Factor: ", sprintf("%.3f", pred_metrics$profit_factor), "\n")
+  }
+
+  # Create visualizations
+  cat("Creating visualizations...\n")
+  p1 <- plot_strategy_comparison(test_data, strategies_list, strategy_names)
+  p2 <- plot_returns_distribution(strategies_list, strategy_names)
+  
+  # Return all results
+  return(list(
+    prediction_strategy = pred_results,
+    buy_hold_strategy = bh_results,
+    random_strategy = random_results,
+    comparison = comparison,
+    plot_portfolio = p1,
+    plot_returns = p2,
+    test_data_used = test_data
+  ))
+}
+```
+
+
+```{r}
+n_days <- nrow(test_raw)  
+test_data <- data.frame(
+  Date = test_raw$date,
+  Open = test_raw$open,
+  Close = test_raw$close,
+  Predicted = test_raw$pred_round2
+)
+```
+
+
+```{r display-sample-data, include=FALSE}
+# Display last few rows
+kable(tail(test_data, 10), 
+      caption = "Sample Test Data (last 10 Days)",
+      digits = 2)
+```
+
+#Running Complete Backtest
+
+```{r run-backtest, results='markup'}
+# Run backtest with default parameters
+results <- run_complete_backtest(
+  test_data = test_data,
+  initial_capital = 10000,
+  buy_threshold = 0.01,     # Buy if prediction 1% above current price
+  sell_threshold = 0.01,   # Sell if prediction 1% below current price
+  transaction_cost = 0.001, # 0.1% per transaction
+  risk_free_rate = 0.02     # 2% annual risk-free rate
+)
+```
+
+#Results & Analysis
+
+#Performance Comparison Table
+
+```{r comparison-table, echo=FALSE}
+kable(results$comparison, 
+      caption = "Strategy Performance Comparison",
+      digits = 2)
+```
+
+#Portfolio Value Over Time
+
+```{r portfolio-plot, fig.width=10, fig.height=6, echo=FALSE}
+print(results$plot_portfolio)
+```
+
+Transaction Log (Prediction Strategy):
+
+```{r transaction-log, echo=FALSE}
+kable(head(results$prediction_strategy$transactions, 20), 
+      caption = "Trading Transactions (First 20)",
+      digits = 2)
+```
+
+# Metrics Summary
+
+```{r metrics-summary, echo=FALSE}
+# Create summary table for detailed metrics
+metrics <- results$prediction_strategy$metrics
+
+metrics_summary <- data.frame(
+  Metric = c("Final Portfolio Value","Total Return","Annualized Return","Volatility (Annual)","Sharpe Ratio","Maximum Drawdown","Number of Trades","Win Rate"),
+  Value = c(paste0("£", format(metrics$final_value, big.mark = ",", digits = 2, nsmall = 2)),
+            paste0(sprintf("%.2f", metrics$total_return_pct), "%"),
+            paste0(sprintf("%.2f", metrics$annualized_return_pct), "%"),
+            paste0(sprintf("%.2f", metrics$volatility_pct), "%"),
+            sprintf("%.3f", metrics$sharpe_ratio),
+            paste0(sprintf("%.2f", metrics$max_drawdown_pct), "%"),
+            as.character(metrics$number_of_trades),
+            ifelse(is.na(metrics$win_rate_pct), "N/A", 
+                   paste0(sprintf("%.2f", metrics$win_rate_pct), "%")))
+)
+
+kable(metrics_summary, 
+      caption = "Detailed Performance Metrics - Prediction-Based Strategy",
+      col.names = c("Metric", "Value"))
+```
+
+---
+
+#Interpretation & Discussion
+
+Performance Analysis:
+
+```{r performance-analysis, echo=FALSE, results='asis'}
+pred_return <- results$comparison$Total_Return_Pct[results$comparison$Strategy == "Prediction-Based"]
+bh_return <- results$comparison$Total_Return_Pct[results$comparison$Strategy == "Buy & Hold"]
+random_return <- results$comparison$Total_Return_Pct[results$comparison$Strategy == "Random Trading"]
+
+pred_sharpe <- results$comparison$Sharpe_Ratio[results$comparison$Strategy == "Prediction-Based"]
+bh_sharpe <- results$comparison$Sharpe_Ratio[results$comparison$Strategy == "Buy & Hold"]
+
+cat("Key Findings:")
+
+if (pred_return > bh_return) {
+  cat("he prediction-based strategy outperformed buy & hold by ", sprintf("%.2f", pred_return - bh_return), " percentage points.\n")
+} else {
+  cat("The prediction-based strategy underperformed buy & hold by ", sprintf("%.2f", bh_return - pred_return), " percentage points.\n")
+}
+
+if (pred_sharpe > bh_sharpe) {
+  cat("Risk-adjusted performance (Sharpe ratio) is better than buy & hold (", sprintf("%.3f", pred_sharpe), " vs ", sprintf("%.3f", bh_sharpe), ").\n")
+} else {
+  cat("Risk-adjusted performance (Sharpe ratio) is worse than buy & hold (", sprintf("%.3f", pred_sharpe), " vs ", sprintf("%.3f", bh_sharpe), ").\n")
+}
+
+if (pred_return > random_return * 2) {
+  cat("he strategy significantly outperforms random trading, suggesting genuine predictive skill.\n")
+} else {
+  cat("The strategy's performance is not significantly better than random trading**, which raises concerns about predictive power.\n")
+}
+```
+
+# References
+https://www.sciencedirect.com/science/article/pii/S0377221717310652
+https://colah.github.io/posts/2015-08-Understanding-LSTMs/
+https://karpathy.github.io/2015/05/21/rnn-effectiveness/
+https://keras.io/getting_started/faq/ 
